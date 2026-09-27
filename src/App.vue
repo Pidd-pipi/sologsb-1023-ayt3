@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, ref } from 'vue';
 import { Message } from '@arco-design/web-vue';
 import { statusLabel, useCollation } from './composables/useCollation';
 import type { AlignmentRow, DifferenceStatus } from './types';
@@ -26,6 +26,11 @@ const {
   updateRow,
   shiftPairing,
   moveRow,
+  addOpinion,
+  removeOpinion,
+  adoptOpinion,
+  unadoptOpinion,
+  setRejectionReason,
   acceptRows,
   acceptAll,
   nextDifference,
@@ -33,24 +38,24 @@ const {
   undo,
   redo,
   exportMarkdown,
-  exportJson,
-  commit
+  exportJson
 } = useCollation();
+
+const HANDLER_STORAGE_KEY = 'sologsb-1023/handler';
 
 const importVisible = ref(false);
 const onlyDifferences = ref(false);
 const rowQuery = ref('');
-const noteDraft = ref('');
-const sourceDraft = ref('');
+const opinionDraft = ref({ note: '', source: '', handler: localStorage.getItem(HANDLER_STORAGE_KEY) ?? '' });
 const importForm = ref({ name: '', source: '', text: '' });
 const fileInput = ref<HTMLInputElement | null>(null);
 
 const columns = [
   { title: '状态', dataIndex: 'status', slotName: 'status', width: 122, fixed: 'left' as const },
-  { title: '底本', dataIndex: 'left', slotName: 'left', width: 330 },
+  { title: '底本', dataIndex: 'left', slotName: 'left', width: 310 },
   { title: '对准操作', dataIndex: 'align', slotName: 'align', width: 112, align: 'center' as const },
-  { title: '参校本', dataIndex: 'right', slotName: 'right', width: 330 },
-  { title: '校记 / 来源', dataIndex: 'note', slotName: 'note', width: 240 }
+  { title: '参校本', dataIndex: 'right', slotName: 'right', width: 310 },
+  { title: '意见 / 采纳结论', dataIndex: 'note', slotName: 'note', width: 260 }
 ];
 
 const filteredRows = computed(() => {
@@ -58,10 +63,30 @@ const filteredRows = computed(() => {
   return rows.value.filter((row) => {
     if (onlyDifferences.value && row.status === 'same') return false;
     if (!query) return true;
-    return [row.left?.text, row.right?.text, row.note, row.source, statusLabel(row.status)]
+    const searchable = [
+      row.left?.text,
+      row.right?.text,
+      row.systemNote,
+      statusLabel(row.status),
+      ...row.opinions.flatMap((opinion) => [opinion.note, opinion.source, opinion.handler])
+    ]
       .filter(Boolean)
-      .some((value) => value!.toLocaleLowerCase().includes(query));
+      .map((value) => value!.toLocaleLowerCase());
+    return searchable.some((value) => value.includes(query));
   });
+});
+
+const selectedAdoptedOpinion = computed(() => {
+  const row = selectedRow.value;
+  return row?.opinions.find((opinion) => opinion.id === row.adoptedOpinionId) ?? null;
+});
+
+const pendingRejectionCount = computed(() => {
+  const row = selectedRow.value;
+  if (!row || !row.adoptedOpinionId) return 0;
+  return row.opinions.filter(
+    (opinion) => opinion.id !== row.adoptedOpinionId && !opinion.rejectionReason.trim()
+  ).length;
 });
 
 const rowSelection = computed(() => ({
@@ -71,14 +96,19 @@ const rowSelection = computed(() => ({
   onlyCurrent: false
 }));
 
-watch(
-  selectedRow,
-  (row) => {
-    noteDraft.value = row?.note ?? '';
-    sourceDraft.value = row?.source ?? '';
-  },
-  { immediate: true }
-);
+function adoptedOf(row: AlignmentRow) {
+  return row.opinions.find((opinion) => opinion.id === row.adoptedOpinionId) ?? null;
+}
+
+function adoptedSummary(row: AlignmentRow) {
+  const note = adoptedOf(row)?.note ?? '';
+  return note.length > 26 ? `${note.slice(0, 26)}…` : note;
+}
+
+function formatTime(value: string) {
+  const time = new Date(value);
+  return Number.isNaN(time.getTime()) ? value : time.toLocaleString('zh-CN');
+}
 
 function statusColor(status: DifferenceStatus) {
   return {
@@ -108,13 +138,23 @@ function onRowClick(record: Record<string, unknown>) {
   selectedRowId.value = row.id;
 }
 
-function saveAnnotation() {
+function appendOpinion() {
   if (!selectedRow.value) return;
-  updateRow(selectedRow.value.id, {
-    note: noteDraft.value.trim(),
-    source: sourceDraft.value.trim()
-  });
-  Message.success('校勘说明已保存');
+  if (!opinionDraft.value.note.trim()) {
+    Message.warning('请先填写意见内容');
+    return;
+  }
+  const ok = addOpinion(selectedRow.value.id, opinionDraft.value);
+  if (ok) {
+    localStorage.setItem(HANDLER_STORAGE_KEY, opinionDraft.value.handler.trim());
+    opinionDraft.value = { note: '', source: '', handler: opinionDraft.value.handler };
+    Message.success('已追加意见，此前的意见均保留');
+  }
+}
+
+function onRejectionReason(rowId: string, opinionId: string, value: string | Event) {
+  const reason = typeof value === 'string' ? value : (value.target as HTMLInputElement).value;
+  setRejectionReason(rowId, opinionId, reason);
 }
 
 function download(filename: string, text: string, type: string) {
@@ -271,7 +311,7 @@ window.addEventListener('beforeunload', beforeUnload);
             </div>
           </div>
           <a-button long type="primary" status="success" style="margin-top: 12px" :disabled="!unresolvedCount" @click="acceptAll">
-            批量接受全部建议
+            批量接受（跳过无采纳结论的行）
           </a-button>
           <a-button long style="margin-top: 8px" @click="nextDifference">跳到下一处未接受差异</a-button>
         </section>
@@ -350,7 +390,7 @@ window.addEventListener('beforeunload', beforeUnload);
                 <a-button size="mini" @click.stop="shiftPairing(record.id, 1)">配对下移</a-button>
                 <a-button size="mini" @click.stop="moveRow(record.id, -1)">整行上移</a-button>
                 <a-button size="mini" @click.stop="moveRow(record.id, 1)">整行下移</a-button>
-                <a-tooltip content="接受这一行的自动判断">
+                <a-tooltip content="无采纳结论时批量接受会跳过该行">
                   <a-button size="mini" status="success" @click.stop="acceptRows([record.id])">接受</a-button>
                 </a-tooltip>
               </a-space>
@@ -368,10 +408,15 @@ window.addEventListener('beforeunload', beforeUnload);
 
             <template #note="{ record }">
               <div style="font-size: 12px; line-height: 1.6; color: #4e5969">
-                <div>{{ record.note || '尚未填写校勘说明' }}</div>
-                <div v-if="record.source" style="margin-top: 5px; color: #86909c">来源：{{ record.source }}</div>
-                <a-tag v-if="record.accepted" size="small" color="green" style="margin-top: 7px">已接受</a-tag>
-                <a-tag v-else size="small" color="orange" style="margin-top: 7px">待处理</a-tag>
+                <div v-if="record.systemNote" style="color: #86909c">{{ record.systemNote }}</div>
+                <div>
+                  {{ record.opinions.length ? `共 ${record.opinions.length} 条意见` : '暂无意见' }}
+                </div>
+                <div v-if="adoptedOf(record)" style="margin-top: 4px; color: #00875a">
+                  已采纳：{{ adoptedSummary(record) }}
+                </div>
+                <a-tag v-if="record.accepted" size="small" color="green" style="margin-top: 7px">已完成</a-tag>
+                <a-tag v-else size="small" color="orange" style="margin-top: 7px">待处理·未采纳</a-tag>
               </div>
             </template>
 
@@ -410,14 +455,59 @@ window.addEventListener('beforeunload', beforeUnload);
           </section>
 
           <section class="panel-section">
-            <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">校勘说明</div>
+            <div style="display: flex; align-items: center; margin-bottom: 10px">
+              <span style="color: #86909c; font-size: 12px">校勘意见（{{ selectedRow.opinions.length }} 条，可追加）</span>
+              <a-tag v-if="selectedAdoptedOpinion" size="small" color="green" style="margin-left: auto">已有结论</a-tag>
+              <a-tag v-else size="small" color="orange" style="margin-left: auto">未采纳</a-tag>
+            </div>
+            <a-empty v-if="!selectedRow.opinions.length" description="还没有意见，可在下方追加" />
+            <div
+              v-for="(opinion, opinionIndex) in selectedRow.opinions"
+              :key="opinion.id"
+              class="opinion-card"
+              :class="{ adopted: opinion.id === selectedRow.adoptedOpinionId }"
+            >
+              <div style="font-size: 13px; line-height: 1.6">
+                {{ opinionIndex + 1 }}. {{ opinion.note }}
+              </div>
+              <div class="opinion-meta">
+                来源：{{ opinion.source || '未注明' }} · 处理人：{{ opinion.handler }} · {{ formatTime(opinion.createdAt) }}
+              </div>
+              <div v-if="opinion.id === selectedRow.adoptedOpinionId" style="margin-top: 8px">
+                <a-tag size="small" color="green">已采纳</a-tag>
+                <a-button size="mini" style="margin-left: 8px" @click="unadoptOpinion(selectedRow.id)">撤销采纳</a-button>
+              </div>
+              <template v-else>
+                <div style="margin-top: 8px; display: flex; gap: 8px">
+                  <a-button size="mini" type="primary" status="success" @click="adoptOpinion(selectedRow.id, opinion.id)">
+                    采纳此条
+                  </a-button>
+                  <a-popconfirm content="确定删除这条意见？可通过撤销恢复" @ok="removeOpinion(selectedRow.id, opinion.id)">
+                    <a-button size="mini" status="danger">删除</a-button>
+                  </a-popconfirm>
+                </div>
+                <a-input
+                  v-if="selectedRow.adoptedOpinionId"
+                  size="small"
+                  style="margin-top: 8px"
+                  :model-value="opinion.rejectionReason"
+                  placeholder="否决原因：说明为何不采纳这条意见"
+                  @change="(value: string) => onRejectionReason(selectedRow!.id, opinion.id, value)"
+                />
+              </template>
+            </div>
+          </section>
+
+          <section class="panel-section">
+            <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">追加新意见（不会覆盖已有意见）</div>
             <a-textarea
-              v-model="noteDraft"
+              v-model="opinionDraft.note"
               placeholder="记录字形、词句、标点或语义差异的判断依据"
-              :auto-size="{ minRows: 5, maxRows: 10 }"
+              :auto-size="{ minRows: 3, maxRows: 8 }"
             />
-            <a-input v-model="sourceDraft" placeholder="来源，如：某刻本、某整理者" style="margin-top: 10px" />
-            <a-button long type="primary" style="margin-top: 10px" @click="saveAnnotation">保存校勘说明</a-button>
+            <a-input v-model="opinionDraft.source" placeholder="来源，如：某刻本、某整理稿" style="margin-top: 8px" />
+            <a-input v-model="opinionDraft.handler" placeholder="处理人（署名，会记住上次填写）" style="margin-top: 8px" />
+            <a-button long type="primary" style="margin-top: 8px" @click="appendOpinion">追加意见</a-button>
           </section>
 
           <section class="panel-section">
@@ -434,21 +524,27 @@ window.addEventListener('beforeunload', beforeUnload);
           </section>
 
           <section class="panel-section">
-            <a-button
-              long
-              :status="selectedRow.accepted ? 'normal' : 'success'"
-              :type="selectedRow.accepted ? 'outline' : 'primary'"
-              @click="updateRow(selectedRow.id, { accepted: !selectedRow.accepted })"
-            >
-              {{ selectedRow.accepted ? '撤回接受状态' : '接受这条校勘建议' }}
-            </a-button>
+            <a-alert v-if="selectedRow.status === 'same'" type="success" :show-icon="true">
+              两本完全相同，无需校勘结论。
+            </a-alert>
+            <template v-else-if="selectedAdoptedOpinion">
+              <a-alert type="success" :show-icon="true">
+                已完成：采纳了「{{ selectedAdoptedOpinion.handler }}」的意见，导出时其余意见将连同否决原因一并保留。
+              </a-alert>
+              <a-alert v-if="pendingRejectionCount" type="warning" :show-icon="true" style="margin-top: 8px">
+                还有 {{ pendingRejectionCount }} 条被否决的意见未填写否决原因。
+              </a-alert>
+            </template>
+            <a-alert v-else type="warning" :show-icon="true">
+              尚未采纳结论：此行不算完成，批量接受会跳过。请从上方意见中采纳一条。
+            </a-alert>
           </section>
         </template>
 
         <div v-else class="inspector-empty">
           <div>
             <div style="font-size: 30px; color: #c9cdd4">择</div>
-            <p>选择中间表格的一行<br />即可调整错位并填写校勘说明</p>
+            <p>选择中间表格的一行<br />即可调整错位、追加多条意见并采纳一条结论</p>
           </div>
         </div>
 

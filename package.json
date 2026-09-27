@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:smoke": "esbuild scripts/smoke.ts --bundle --format=esm --platform=node --outfile=node_modules/.cache-smoke.mjs && node node_modules/.cache-smoke.mjs"
   },
   "dependencies": {
     "@arco-design/web-vue": "2.58.0",

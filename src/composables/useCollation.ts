@@ -2,6 +2,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { sampleVersions, splitIntoUnits } from '../data';
 import type {
   AlignmentRow,
+  CollationOpinion,
   ComparisonRules,
   DifferenceStatus,
   PersistedCollationState,
@@ -10,6 +11,14 @@ import type {
 } from '../types';
 
 const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
+
+/** 自动对齐生成的对齐说明（旧草稿中曾写入 source 字段，迁移时据此识别） */
+const AUTO_HINTS = new Set([
+  '自动补齐右侧新增内容',
+  '自动标记左侧缺失内容',
+  '右侧有段落或句子插入',
+  '左侧有段落或句子缺失'
+]);
 
 const variantMap: Record<string, string> = {
   為: '为',
@@ -121,8 +130,9 @@ async function alignUnits(
           right,
           status: statusFor(left, right, score),
           similarity: score,
-          note: '',
-          source: '',
+          systemNote: '',
+          opinions: [],
+          adoptedOpinionId: null,
           accepted: score > 0.995,
           manuallyAdjusted: false
         });
@@ -150,7 +160,7 @@ function makeRow(
   left: TextUnit | undefined,
   right: TextUnit | undefined,
   rules: ComparisonRules,
-  source: string
+  systemNote: string
 ): AlignmentRow {
   const score = left && right ? Number(similarity(normalized(left.text, rules), normalized(right.text, rules)).toFixed(3)) : 0;
   return {
@@ -159,11 +169,106 @@ function makeRow(
     right,
     status: statusFor(left, right, score),
     similarity: score,
-    note: '',
-    source,
+    systemNote,
+    opinions: [],
+    adoptedOpinionId: null,
     accepted: score > 0.995,
     manuallyAdjusted: false
   };
+}
+
+function newOpinionId() {
+  return `opinion-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 该行是否已有采纳结论；差异行没有结论就不能算完成 */
+export function rowHasConclusion(row: AlignmentRow) {
+  return row.status === 'same' || row.opinions.some((opinion) => opinion.id === row.adoptedOpinionId);
+}
+
+/** 维护不变式：差异行的 accepted 必须有采纳结论支撑，否则回退为未完成 */
+function normalizeCompletion(row: AlignmentRow) {
+  if (row.status !== 'same' && !rowHasConclusion(row)) {
+    row.accepted = false;
+  }
+}
+
+function migrateOpinion(raw: Partial<CollationOpinion>, fallbackId: string): CollationOpinion {
+  return {
+    id: typeof raw.id === 'string' && raw.id ? raw.id : fallbackId,
+    note: typeof raw.note === 'string' ? raw.note : '',
+    source: typeof raw.source === 'string' ? raw.source : '',
+    handler: typeof raw.handler === 'string' && raw.handler.trim() ? raw.handler : '未署名',
+    createdAt: typeof raw.createdAt === 'string' && raw.createdAt ? raw.createdAt : new Date().toISOString(),
+    rejectionReason: typeof raw.rejectionReason === 'string' ? raw.rejectionReason : ''
+  };
+}
+
+/**
+ * 旧草稿迁移：单行的 note/source 升级为一条意见；
+ * 旧版已接受但没有结论的差异行，补记一条迁移意见并采纳，保持“已完成”状态。
+ */
+function migrateRow(raw: Partial<AlignmentRow>, index: number): AlignmentRow {
+  const row = raw as AlignmentRow;
+  const opinions: CollationOpinion[] = Array.isArray(raw.opinions)
+    ? raw.opinions.map((opinion, opinionIndex) =>
+        migrateOpinion(opinion ?? {}, `opinion-migrated-${index}-${opinionIndex}`)
+      )
+    : [];
+
+  const legacyNote = (raw.note ?? '').trim();
+  const legacySource = (raw.source ?? '').trim();
+  const isAutoHint = AUTO_HINTS.has(legacySource);
+  if (isAutoHint && !raw.systemNote) {
+    row.systemNote = legacySource;
+  }
+  const migratedSource = isAutoHint ? '' : legacySource;
+  if ((legacyNote || migratedSource) && !opinions.length) {
+    opinions.push({
+      id: `opinion-migrated-${index}`,
+      note: legacyNote || '（旧草稿仅记录了来源，无校记正文）',
+      source: migratedSource,
+      handler: '旧草稿迁移',
+      createdAt: new Date().toISOString(),
+      rejectionReason: ''
+    });
+  }
+
+  let adoptedOpinionId =
+    typeof raw.adoptedOpinionId === 'string' &&
+    opinions.some((opinion) => opinion.id === raw.adoptedOpinionId)
+      ? raw.adoptedOpinionId
+      : null;
+
+  if (raw.accepted && row.status !== 'same' && !adoptedOpinionId) {
+    if (!opinions.length) {
+      opinions.push({
+        id: `opinion-migrated-${index}`,
+        note: '旧草稿中此行已接受，迁移时补记为采纳结论。',
+        source: migratedSource,
+        handler: '旧草稿迁移',
+        createdAt: new Date().toISOString(),
+        rejectionReason: ''
+      });
+    }
+    adoptedOpinionId = opinions[0].id;
+  }
+
+  row.opinions = opinions;
+  row.adoptedOpinionId = adoptedOpinionId;
+  normalizeCompletion(row);
+  row.note = '';
+  row.source = '';
+  return row;
+}
+
+function isLegacyState(raw: unknown) {
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed?.rows) && parsed.rows.some((row: unknown) => typeof row === 'object' && row !== null && !('opinions' in row));
+  } catch {
+    return false;
+  }
 }
 
 function defaultRules(): ComparisonRules {
@@ -222,7 +327,7 @@ export function useCollation() {
     versions.value = parsed.versions;
     leftVersionId.value = parsed.leftVersionId;
     rightVersionId.value = parsed.rightVersionId;
-    rows.value = parsed.rows;
+    rows.value = (parsed.rows ?? []).map((row, index) => migrateRow(row as Partial<AlignmentRow>, index));
     rules.value = parsed.rules;
     selectedRowId.value = parsed.selectedRowId;
     persist();
@@ -275,7 +380,9 @@ export function useCollation() {
         const score = Number(
           similarity(normalized(row.left.text, rules.value), normalized(row.right.text, rules.value)).toFixed(3)
         );
-        return { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
+        const next: AlignmentRow = { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
+        normalizeCompletion(next);
+        return next;
       });
       selectedRowIds.value = [];
     });
@@ -284,7 +391,10 @@ export function useCollation() {
   function updateRow(id: string, patch: Partial<AlignmentRow>) {
     commit('已更新校勘行', () => {
       const row = rows.value.find((item) => item.id === id);
-      if (row) Object.assign(row, patch, { manuallyAdjusted: true });
+      if (row) {
+        Object.assign(row, patch, { manuallyAdjusted: true });
+        normalizeCompletion(row);
+      }
     });
   }
 
@@ -309,6 +419,7 @@ export function useCollation() {
           row.similarity = 0;
         }
         row.manuallyAdjusted = true;
+        normalizeCompletion(row);
       }
     });
   }
@@ -324,20 +435,100 @@ export function useCollation() {
     });
   }
 
+  function addOpinion(rowId: string, payload: { note: string; source: string; handler: string }) {
+    const note = payload.note.trim();
+    if (!note) return false;
+    const opinion: CollationOpinion = {
+      id: newOpinionId(),
+      note,
+      source: payload.source.trim(),
+      handler: payload.handler.trim() || '未署名',
+      createdAt: new Date().toISOString(),
+      rejectionReason: ''
+    };
+    commit('已追加一条校勘意见', () => {
+      const row = rows.value.find((item) => item.id === rowId);
+      if (!row) return;
+      row.opinions.push(opinion);
+      row.manuallyAdjusted = true;
+    });
+    return true;
+  }
+
+  function removeOpinion(rowId: string, opinionId: string) {
+    commit('已删除一条校勘意见', () => {
+      const row = rows.value.find((item) => item.id === rowId);
+      if (!row) return;
+      row.opinions = row.opinions.filter((opinion) => opinion.id !== opinionId);
+      if (row.adoptedOpinionId === opinionId) {
+        row.adoptedOpinionId = null;
+        normalizeCompletion(row);
+      }
+    });
+  }
+
+  function adoptOpinion(rowId: string, opinionId: string) {
+    commit('已采纳一条校勘意见，此行判定为完成', () => {
+      const row = rows.value.find((item) => item.id === rowId);
+      if (!row || !row.opinions.some((opinion) => opinion.id === opinionId)) return;
+      row.adoptedOpinionId = opinionId;
+      row.accepted = true;
+      row.manuallyAdjusted = true;
+    });
+  }
+
+  function unadoptOpinion(rowId: string) {
+    commit('已撤销采纳结论，此行重新待处理', () => {
+      const row = rows.value.find((item) => item.id === rowId);
+      if (!row) return;
+      row.adoptedOpinionId = null;
+      normalizeCompletion(row);
+    });
+  }
+
+  function setRejectionReason(rowId: string, opinionId: string, reason: string) {
+    const target = rows.value.find((item) => item.id === rowId);
+    const opinion = target?.opinions.find((item) => item.id === opinionId);
+    if (!opinion || opinion.rejectionReason === reason.trim()) return;
+    commit('已填写否决原因', () => {
+      opinion.rejectionReason = reason.trim();
+    });
+  }
+
+  /**
+   * 批量接受只会确认已有采纳结论（或相同）的行；
+   * 没有采纳结论的差异行直接跳过，不能算完成。
+   */
   function acceptRows(ids: string[]) {
     if (!ids.length) return;
-    commit(`已接受 ${ids.length} 条校对建议`, () => {
-      const selected = new Set(ids);
-      rows.value.forEach((row) => {
-        if (selected.has(row.id)) row.accepted = true;
+    const selected = new Set(ids);
+    const targets = rows.value.filter((row) => selected.has(row.id));
+    const acceptable = targets.filter((row) => rowHasConclusion(row));
+    const skipped = targets.length - acceptable.length;
+    if (!acceptable.length) {
+      message.value = '所选行均无采纳结论，已跳过：请先为每行采纳一条意见';
+      return;
+    }
+    const label = `已接受 ${acceptable.length} 条建议` + (skipped ? `，跳过 ${skipped} 条无采纳结论的行` : '');
+    commit(label, () => {
+      acceptable.forEach((row) => {
+        row.accepted = true;
       });
       selectedRowIds.value = [];
     });
   }
 
   function acceptAll() {
-    commit('已批量接受全部差异建议', () => {
-      rows.value.forEach((row) => {
+    const targets = rows.value.filter((row) => row.status !== 'same' || !row.accepted);
+    const acceptable = targets.filter((row) => rowHasConclusion(row));
+    const skipped = targets.length - acceptable.length;
+    if (!acceptable.length) {
+      message.value = '批量接受已跳过：差异行均无采纳结论，请先逐条采纳意见';
+      return;
+    }
+    const label = `已批量接受 ${acceptable.length} 条建议` + (skipped ? `，跳过 ${skipped} 条无采纳结论的行` : '');
+    commit(label, () => {
+      acceptable.forEach((row) => {
         row.accepted = true;
       });
       selectedRowIds.value = [];
@@ -377,7 +568,8 @@ export function useCollation() {
   }
 
   function exportMarkdown() {
-    const changed = rows.value.filter((row) => row.status !== 'same' || row.note || row.source);
+    const changed = rows.value.filter((row) => row.status !== 'same' || row.opinions.length || row.systemNote);
+    const resolved = changed.filter(rowHasConclusion).length;
     const lines = [
       '# 校勘记',
       '',
@@ -385,17 +577,43 @@ export function useCollation() {
       `- 参校本：${rightVersion.value?.name ?? '未选择'}`,
       `- 比较规则：${rules.value.ignorePunctuation ? '忽略标点；' : ''}${rules.value.ignoreVariants ? '忽略异体字；' : ''}保留正文。`,
       `- 导出时间：${new Date().toLocaleString('zh-CN')}`,
-      '',
-      '| 序 | 类别 | 底本 | 参校本 | 校记 | 来源 | 状态 |',
-      '|---|---|---|---|---|---|---|'
+      `- 结论统计：共 ${changed.length} 条记录，${resolved} 条已采纳结论，${changed.length - resolved} 条未完成`,
+      ''
     ];
     changed.forEach((row, index) => {
-      const cell = (value?: string) => (value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' ');
-      lines.push(
-        `| ${index + 1} | ${statusLabel(row.status)} | ${cell(row.left?.text)} | ${cell(row.right?.text)} | ${cell(row.note)} | ${cell(row.source)} | ${row.accepted ? '已接受' : '待处理'} |`
-      );
+      const adopted = row.opinions.find((opinion) => opinion.id === row.adoptedOpinionId) ?? null;
+      lines.push(`## ${index + 1}. ${statusLabel(row.status)}（相似度 ${Math.round(row.similarity * 100)}%）`, '');
+      lines.push(`- 底本：${row.left?.text ?? '（无）'}`);
+      lines.push(`- 参校本：${row.right?.text ?? '（无）'}`);
+      if (row.systemNote) lines.push(`- 对齐说明：${row.systemNote}`);
+      if (adopted) {
+        const adoptedIndex = row.opinions.findIndex((opinion) => opinion.id === adopted.id) + 1;
+        lines.push(`- 结论：**已采纳第 ${adoptedIndex} 条意见**（处理人：${adopted.handler}）`);
+      } else {
+        lines.push('- 结论：**尚未采纳任何意见，此行未完成，批量接受会跳过**');
+      }
+      if (row.opinions.length) {
+        lines.push('- 全部意见：');
+        row.opinions.forEach((opinion, opinionIndex) => {
+          const rejected = adopted !== null && opinion.id !== adopted.id;
+          const state = adopted?.id === opinion.id ? '已采纳' : rejected ? '已否决' : '未表态';
+          const detail = [
+            `${opinionIndex + 1}. 【${state}】${opinion.note}`,
+            `来源：${opinion.source || '未注明'}`,
+            `处理人：${opinion.handler}`,
+            `提交时间：${new Date(opinion.createdAt).toLocaleString('zh-CN')}`
+          ];
+          if (rejected) detail.push(`否决原因：${opinion.rejectionReason.trim() || '（未填写）'}`);
+          lines.push('  - ' + detail.join('；'));
+        });
+      } else {
+        lines.push('- 全部意见：（暂无）');
+      }
+      lines.push('');
     });
-    lines.push('', `共 ${changed.length} 条校勘记录。`);
+    lines.push(
+      `共 ${changed.length} 条校勘记录，其中 ${resolved} 条已有采纳结论，${changed.length - resolved} 条待处理。`
+    );
     return lines.join('\n');
   }
 
@@ -405,7 +623,21 @@ export function useCollation() {
         left: leftVersion.value,
         right: rightVersion.value,
         rules: rules.value,
-        rows: rows.value,
+        summary: {
+          totalRows: rows.value.length,
+          differenceRows: rows.value.filter((row) => row.status !== 'same').length,
+          resolvedRows: rows.value.filter(rowHasConclusion).length,
+          unresolvedRows: rows.value.filter((row) => !rowHasConclusion(row)).length,
+          opinionCount: rows.value.reduce((sum, row) => sum + row.opinions.length, 0)
+        },
+        rows: rows.value.map((row) => ({
+          ...row,
+          adoptedOpinion: row.opinions.find((opinion) => opinion.id === row.adoptedOpinionId) ?? null,
+          rejectedOpinions: row.adoptedOpinionId
+            ? row.opinions.filter((opinion) => opinion.id !== row.adoptedOpinionId)
+            : [],
+          complete: rowHasConclusion(row)
+        })),
         exportedAt: new Date().toISOString()
       },
       null,
@@ -417,8 +649,11 @@ export function useCollation() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
+        const legacy = isLegacyState(raw);
         restore(raw);
-        message.value = '已恢复浏览器中的校勘草稿';
+        message.value = legacy
+          ? '已恢复浏览器中的校勘草稿，旧版单条校记已迁移为可追加的意见列表'
+          : '已恢复浏览器中的校勘草稿';
       } else {
         message.value = '已载入示例版本，正在自动对齐…';
         void runAlignment(false);
@@ -462,6 +697,11 @@ export function useCollation() {
     updateRow,
     shiftPairing,
     moveRow,
+    addOpinion,
+    removeOpinion,
+    adoptOpinion,
+    unadoptOpinion,
+    setRejectionReason,
     acceptRows,
     acceptAll,
     nextDifference,

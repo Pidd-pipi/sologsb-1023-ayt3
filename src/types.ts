@@ -18,14 +18,30 @@ export interface VersionDocument {
   units: TextUnit[];
 }
 
+export interface CollationOpinion {
+  id: string;
+  note: string;
+  source: string;
+  handler: string;
+  createdAt: string;
+  /** 未被采纳时填写的否决原因 */
+  rejectionReason: string;
+}
+
 export interface AlignmentRow {
   id: string;
   left?: TextUnit;
   right?: TextUnit;
   status: DifferenceStatus;
   similarity: number;
-  note: string;
-  source: string;
+  /** @deprecated 旧草稿的单条校记，迁移后清空，仅用于读取旧数据 */
+  note?: string;
+  /** @deprecated 旧草稿的单一来源，迁移后清空，仅用于读取旧数据 */
+  source?: string;
+  /** 自动对齐时生成的对齐说明（非校勘意见） */
+  systemNote?: string;
+  opinions: CollationOpinion[];
+  adoptedOpinionId: string | null;
   accepted: boolean;
   manuallyAdjusted: boolean;
 }
